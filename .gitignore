@@ -1,0 +1,11 @@
+# ==== OS ====
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# ==== IDE ====
+.vscode
+
+# ==== Artifacts ====
+build/
