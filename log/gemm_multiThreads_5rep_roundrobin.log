@@ -1,0 +1,6 @@
+C(5347, 4655) = A(5347, 4201) x B(4201, 4655)
+With Warm-up x 1 rep | Algorithm x 5 rep and take median.
+(MC, NC, KC, workers) = (32, 2048, 256, 8) | Time Elapsed Alg = 510.435ms
+(MC, NC, KC, workers) = (32, 2048, 384, 8) | Time Elapsed Alg = 501.833ms
+(MC, NC, KC, workers) = (32, 2048, 512, 8) | Time Elapsed Alg = 498.85ms
+Best Performance (MC, NC, KC) = (32, 2048, 512, 8) | Time Spanned Alg = 498.85ms
