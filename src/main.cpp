@@ -217,8 +217,7 @@ int main() {
                         << perf.second.alg_ms << "ms\n";
         }
 
-        std::string logname{"gemm_mThds_" +std::to_string(rep_bench) + "rep.log"};
-        std::ofstream ofile("log/" + logname);
+        std::ofstream ofile("log/gemm_mThds.log");
         if (ofile.is_open()) {
             ofile << "C(" << M << ", " << N << ") = ";
             ofile << "A(" << M << ", " << K << ") x B(" << K << ", " << N << ")\n";
