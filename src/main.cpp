@@ -121,11 +121,8 @@ int main() {
         };
 
         int rep_warmup = 20;
-        // int rep_warmup = 1;
         int rep_bench = 30;
-        // int rep_bench = 5;
 
-        // Gemm gemm(configs.back().workers);
         Gemm_DoubleBuffer gemm(configs.back().workers);
         std::cout << "Start GEMM Warm-up...";
         for (int i = 0; i < rep_warmup; i++) {
