@@ -16,13 +16,6 @@ namespace ToolKit_GEMM {
         double alg_ms;
     };
 
-    std::pair<Config, Benchmark> get_best_perf(const std::vector<std::pair<Config, Benchmark>>& vec) {
-        auto it = std::min_element(vec.begin(), vec.end(), [](const auto& a, const auto& b) {
-            return a.second.alg_ms < b.second.alg_ms;
-        });
-        return *it;
-    }
-
     void initMat(float* mat, size_t dim) {
         std::fill(mat, mat + dim, 0.0f);
     }

@@ -9,3 +9,7 @@ Icon?
 
 # ==== Artifacts ====
 build/
+
+# ==== Python ====
+.venv
+__pycache__
