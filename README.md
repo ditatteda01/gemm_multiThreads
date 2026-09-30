@@ -1,99 +1,241 @@
-# GEMM 效能調參 Benchmark：方法論與結果
+# GEMM Multi-Threads
 
-BLIS 風格 GEMM 實作（C++ / NEON / ThreadPool）在 Apple M1（MacBook Air, 無風扇）上的
-MC/NC/KC block size 調參結果，重點記錄如何在**持續高負載導致的熱節流**下取得可信的
-效能排名。
+A multi-threaded, BLIS-style GEMM implementation for Apple Silicon (ARM NEON). It benchmarks different blocking configurations (`MC` / `NC` / `KC`) under **heavy thermal throttling** to obtain a fair, realistic ranking.
 
-矩陣規模：`C(5347, 4655) = A(5347, 4201) x B(4201, 4655)`，float32，8 threads。
+The project started as C++ only. Analysing the benchmark data turned out to be much easier with Python tooling, so it is now a hybrid project. To quantify the thermal-throttling effect, `powermetrics` is run separately in a terminal. Three parts produce data:
+
+| Part | Output | Description |
+|------|--------|-------------|
+| Terminal | `thermal_log.txt` | CPU metrics from `powermetrics` (sampled per second) |
+| C++ | `./log/bench_runs.csv`, `./log/gemm_mThds.log` | GEMM performance per run |
+| Python | `./data/integrated_bench.csv`, figures under `./png/` | Merges `bench_runs.csv` with `thermal_log.txt`, then analyses and plots |
+
+> **Note:** Open a separate terminal, `cd` into `./log/`, and then start `powermetrics` (it requires `sudo`). This way `thermal_log.txt` is written to where the Python scripts expect it.
 
 ---
 
-## 背景：為什麼不能直接照原始 sweep 結果調參
+## Requirements
 
-第一版 benchmark（大區塊依序跑完每個 config 的所有 repetition）觀察到 KC=198 系統性地比其他 KC 值慢 22–30%。看起來像是 cache line 不對齊（198×4B=792B 無法被 128B cache line 整除）造成的硬體限制，但這個假說有一個沒被排除的混淆變因：**KC=198 剛好被排在 sweep 的最後一批**，而 Apple M1（無風扇）在連續高負載下會顯著降頻。
+- Python 3
+- C++17
+- CMake ≥ 3.20
+- ARM NEON
 
-驗證方式：把 KC=198 的順序調到第一位，結果在多組 MC/NC 組合下變成最快，證實原本的排名差異主要是**執行順序造成的熱節流**，不是 cache 對齊的硬體限制。
+---
 
-## 方法論：round-robin + 已知熱穩態
+## Project Structure
 
-為了得到不被執行順序污染的排名，最終採用的協定：
-
-1. **Warm-up**：正式計時前，先用全部 60 組 config 跑 N 輪暖機（不計時），讓系統進入一個已知、可重現的熱狀態，而不是從冷機開始。
-
-2. **Round-robin benchmark**：不是「洗牌一次、每個 config 連續跑 N 次」（那仍然是大區塊，只是區塊被打散了順序），而是**每一輪都重新洗牌**，60 個 config 在每輪內全部跑過一次再進下一輪。任何殘留的熱漂移會被均勻分攤到所有 config，不會集中在特定幾組上。
-
-3. **溫度/頻率同步記錄**：全程用 `powermetrics --samplers cpu_power,thermal -i 1000` 記錄 P-Cluster 頻率與 thermal pressure level，事後可與 benchmark log 的時間戳對齊，驗證是否真的達到穩態、round-robin 是否有效抵銷順序效應。
-
-4. **C++ 端獨立記錄 wall-clock 時間戳**（見 `logger.hpp`），與 `powermetrics` 使用同一個時鐘基準（`system_clock`，非計時用的 `high_resolution_clock`），確保兩份 log 能精確合併分析。
-
-**最終跑法：20 輪 warm-up + 30 輪 round-robin benchmark，每輪 60 config，共 1800 次正式量測，全程同步記錄 thermal log。**
-
-## 驗證結果：這次的 round-robin 有沒有真的消除順序偏差？
-
-把 1800 筆 benchmark 記錄與同一小時的 thermal log（3600 筆，1Hz 取樣）依時間戳合併分析：
-
-| 指標 | 結果 | 解讀 |
-|:---|:---|:---|
-| Thermal pressure level | 全部 1800 筆皆為 `Heavy` | benchmark 全程處於同一個節流等級，沒有中途回到 Nominal |
-| P-Cluster 頻率 | 中位數 831 MHz，30 輪平均值都落在 832–837 MHz | 頻率打平，round 之間無趨勢 |
-| position vs 頻率 相關性 | r = -0.024（p = 0.31，不顯著） | round-robin 成功消除了頻率上的順序效應 |
-| position vs 時間 相關性（原始） | r = 0.082（p < 0.001，但解釋力極低） | 弱相關，多半是雜訊 |
-| position vs 時間 相關性（扣除各 config 自身均值後） | r = 0.231，R² = 0.054，估計總漂移約 16ms / 1800 次 | 有殘留的系統性漂移，但量級遠小於 config 間差距（100–300ms），不足以翻轉排名 |
-
-***另外發現一個量測假影：全場最慢的 config（MC=16, NC=128, KC=128）因為單次執行時間拖得比其他組長，1Hz 的 `powermetrics` 取樣有更高機率剛好落在單執行緒的 correctness-check / matrix-init 空檔，導致該組頻率讀數異常偏高（900–957MHz vs. 其他組穩定的 828–834MHz）。這只影響「拿頻率做事後分析」的準確性，不影響 C++ 內部計時本身的 `time_ms`，因此不影響排名結論。***
-
-## 最終排名（深度節流穩態下）
-
-| 排名 | MC | NC | KC | Median (ms) | IQR |
-|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1 | 32 | 2048 | 384 | 1245.9 | 27.7 |
-| 2 | 64 | 2048 | 384 | 1246.6 | 31.9 |
-| 3 | 32 | 1024 | 384 | 1248.4 | 26.4 |
-| 4 | 16 | 1024 | 384 | 1252.0 | 21.5 |
-| 5 | 64 | 1024 | 384 | 1253.6 | 16.1 |
-| ⋯ | | | | | |
-| 60 | 16 | 128 | 128 | 1554.0 | 18.6 |
-
-60 組 config 量測結果見 `gemm_mthread_30rep_roundrobin`，以及逐次量測數據 `bench_runs.csv`。
-
-**⚠️ 這份排名的適用範圍是「持續高負載、深度節流穩態」（P-Cluster ≈ 828MHz，約為 M1 峰值 3.2GHz 的 26%），不是峰值/冷機性能。** 同一份程式碼在冷機或輕度節流下量測，~~KC≈128~~ KC=384 系列反而更快（見前段 KC=198 異常排查過程）——**最優 block size 會隨熱力學狀態改變，不存在單一「正確」的 MC/NC/KC**。若之後有明確的部署場景（例如：間歇性單次呼叫 vs. 長時間批次運算），應針對該場景的實際熱力學條件重新用同一套 round-robin 協定量測，而不是直接套用這份結果。
-
-## 檔案
-
-| 檔案 | 用途 |
-|:---|:---|
-| `main.cpp` | benchmark driver，round-robin 主迴圈 |
-| `logger.hpp` | 記錄每次執行的 wall-clock 時間戳，供事後與 thermal log 對齊 |
-| `toolkit.hpp` | `correct_check`（相對誤差容忍度）、`get_median` 等工具函式 |
-| `bench_runs.csv` | 1800 筆逐次原始量測數據 |
-| `thermal_log.txt` | 同時段 `powermetrics` 完整輸出（1Hz） |
-
-## 已知限制 / 尚待驗證
-
-- 尚未驗證真正的「冷啟動 / 短暫呼叫」情境下的最優參數，目前只有「深度節流穩態」的完整數據。
-
-- 16ms 的殘留位置漂移原因尚未完全定位（可能是比 828MHz 更緩慢的次要降頻趨勢，或量測雜訊），量級小到不影響排名但值得留意。
-
-## 執行方法
-
-1. 開啟terminal執行CPU監測紀錄
-
-```bash
-cd directory/to/save/your/thermal_log
-sudo powermetrics --samplers cpu_power,thermal -i 1000 -n 3600 | tee thermal_log.txt | grep -E "P-Cluster HW active frequency|Thermal pressure state"
+```text
+matmul-perf-bridge/
+│
+├── data/
+│   └── integrated_bench.csv    # Produced by scripts/01_* (bench_runs.csv + thermal_log.txt)
+│
+├── log/
+│   ├── bench_runs.csv          # Produced by src/main.cpp
+│   ├── gemm_mThds.log          # Produced by src/main.cpp
+│   └── thermal_log.txt         # Produced by powermetrics (terminal)
+│
+├── png/
+│   ├── config_score.png        # Produced by scripts/02_*
+│   └── pcluster_freq.png       # Produced by scripts/02_*
+│
+├── scripts/
+│   ├── 01_integrate_bench.py   # Merge thermal_log.txt into bench_runs.csv
+│   ├── 02_analyze_bench.py     # Analyse integrated_bench.csv and plot figures
+│   └── toolkits.py             # Utilities
+│
+├── include/
+│   ├── gemm.hpp                # GEMM interface
+│   ├── kernel_neon.hpp         # GEMM tool
+│   ├── packing.hpp             # GEMM tool
+│   ├── ThreadPool.hpp          # Thread pool used by GEMM
+│   ├── logger.hpp              # Writes results to bench_runs.csv
+│   └── toolkit.hpp             # Utilities
+│
+├── src/
+│   ├── main.cpp                # Benchmark entry point
+│   └── gemm.cpp                # GEMM implementation
+│
+├── CMakeLists.txt
+│
+└── README.md
 ```
 
-- `powermetrics`: A built-in tool in Mac that measures power and temperature,
-- `--samplers cpu_power,thermal`: This tells the tool to only gather information about the CPU's power usage and the system's thermals.
-- `-i 1000`: Take a sample every 1000 milliseconds.
-- `-n 3600`: Take exactly 3600 samples.
-- `| tee thermal_log.txt`: The `|` symbol takes the data from the previous step and passes it forward. `tee` (T-pipe) takes the data, saves a complete copy of it into a new text file called `thermal_log.txt`, and passes the data forward to the next step.
-- `grep -E "P-Cluster HW active frequency|Thermal"`: This is a filter for the screen. While the text file gets all the data, `grep` ensures the screen only shows lines of text that contain the words "P-Cluster HW active frequency" or "Thermal".
+---
 
-*註：在記錄過程中，如果 Terminal 出現 "Second underflow occurred" 字樣，表示 powermetrics 在採集某個 sample 時，實際經過的時間比預期的取樣間隔還短（內部計時上發生了 underflow），原因可能是採樣本身耗時不穩定，也可能是輸出/IO（例如 pipe 阻塞）拖慢了下一輪取樣的啟動時間。這代表該筆記錄可能不是「乾淨」的一個時間切片——不是超過，而是這次取樣的實際時長跟你指定的 -i 對不上（通常是被壓縮或延後了）。這種情況在系統負載重、或有 tee/grep 等下游處理時更容易出現。解決方法：拉長 -i，或是若有接 pipe，改成單純寫檔（-o）事後再處理，減少 IO 造成的阻塞。*
+## Algorithm
 
-2. 在project下執行程式
+Computes $C = A \times B$, where
 
-```bash
-./build/gemm_mthreads
+- $C \in \mathbb{R}^{M \times N}$
+- $A \in \mathbb{R}^{M \times K}$
+- $B \in \mathbb{R}^{K \times N}$
+
+### Single-thread baseline
+
+C, A and B are partitioned into blocks (macro-panels) and tiles (micro-panels), and the innermost tile update is accelerated with SIMD:
+
+```cpp
+for jp : N
+    for kp : K
+        pack blockB[KC x NC]
+        for ip : M
+            pack blockA[MC x KC]
+            for ir : MC
+                for jr : NC
+                    SIMD on tileC[MR x NR] with blockA, blockB
 ```
+
+### Multi-threaded GEMM
+
+**Step 1: parallelize the `ip` loop.**
+Packing is the bottleneck. `blockA` is packed inside the innermost of the three outer loops, so it is packed far more often than `blockB` and dominates the latency. Moreover, the `blockA` panels are non-overlapping across different `ip`, which makes the `ip` loop an ideal candidate for parallelization.
+
+```cpp
+for jp : N
+    for kp : K
+        pack blockB[KC x NC]
+        for ip : M
+            parallelize {
+                pack blockA[MC x KC]
+                for ir : MC
+                    for jr : NC
+                        SIMD on tileC[MR x NR] with blockA, blockB
+            }
+
+        main thread sync
+```
+
+**Step 2: overlap `blockB` packing with worker computation (double buffering).**
+While the workers are busy packing `blockA` and running SIMD, the main thread would otherwise sit idle. Since `blockB` is being read by the workers, we allocate twice the space (`blockB[KC x NC x 2]`) and let the main thread pack the *next* `blockB` into the unused half.
+
+```cpp
+for jp : N
+    for kp : K
+        // blockB[KC x NC x 2]
+        main thread packs the unused half of blockB
+        main thread syncs: wait for workers to finish with the in-use half
+
+        for ip : M
+            parallelize {
+                pack blockA[MC x KC]
+                for ir : MC
+                    for jr : NC
+                        SIMD on tileC[MR x NR] with blockA, blockB
+            }
+
+main thread sync    // wait for all workers to finish before returning
+```
+
+### Round-robin / shuffled sweep
+
+To avoid a first-run advantage (e.g. the first configuration running while the chip is still cool), every repetition sweeps through the entire set of `MC` / `NC` / `KC` configurations in a freshly shuffled order:
+
+```cpp
+for round : repetitions
+    shuffle config set
+    for config : config set
+        run gemm(config)
+```
+
+---
+
+## Analysis
+
+Problem size: $M / N / K = 5347 / 4655 / 4201$
+
+### Methodology
+
+The analysis has two stages: (1) detect when the CPU has settled into a stable thermal state, and (2) rank the `MC` / `NC` / `KC` configurations using only the runs from that steady state.
+
+#### Stage 1: Finding the steady state
+
+After warmup, the Thermal Pressure Level stays at `Heavy`. The `P-Cluster Frequency` first declines and then flattens out at around the 800th sample.
+
+![P-Cluster Frequency](./png/pcluster_freq.png)
+
+To locate this plateau objectively, the frequency series is smoothed with a rolling median, and the absolute slope between consecutive smoothed points is averaged over a sliding window. The first position where this average drops below a threshold $\varepsilon$ is taken as the start of the steady state.
+
+```text
+rmedian     = rolling_median(p_cluster_freq)
+slopes      = abs(diff(rmedian))
+mean_slope  = rolling_mean(slopes, window = wsize)
+stable_pos  = first index where mean_slope < ε
+```
+
+#### Stage 2: Scoring the configurations
+
+Only runs after `stable_pos` are used, so every configuration is compared under the same thermal condition. Among those runs, only the fastest 10% are kept. The score of a configuration combines *how highly* its runs rank and *how often* they appear in that top group.
+
+```cpp
+steady          = runs[stable_pos:], sorted by performance
+top_10percent   = top 10% runs of steady
+
+// 1. Rank weight: the fastest run gets 1, decaying exponentially
+for i = 0 .. n-1:
+    top[i].w = exp(-i / n)      // n = |top_10percent|
+
+// 2. Aggregate per (MC, NC, KC)
+for each config c:
+    rank_mass[c] = sum of w over c's runs in top_10percent
+    freq[c]      = number of c's runs in top_10percent
+
+// 3. Normalize against the best config
+rank_norm[c] = rank_mass[c] / max(rank_mass)
+freq_norm[c] = log(1 + freq[c]) / log(1 + max(freq))
+
+// 4. Final score
+score[c] = W_RANK * rank_norm[c] + W_FREQ * freq_norm[c]    // W_RANK = 0.7, W_FREQ = 0.3
+```
+
+Or equivalently:
+
+$$
+\text{score}(c) = W_{\text{rank}} \cdot \frac{\sum_{r \in c} e^{-i_r/n}}{\max_{c'} \sum_{r \in c'} e^{-i_r/n}} + W_{\text{freq}} \cdot \frac{\ln(1 + f_c)}{\ln(1 + \max_{c'} f_{c'})}
+$$
+
+where $i_r$ is the rank of run $r$ (0 = fastest), $n$ is the number of top runs, and $f_c$ is the number of runs of configuration $c$ in the top group.
+
+Notes:
+
+- **Rank weight:** the exponential decay rewards faster runs without letting a single lucky run dominate.
+- **Frequency term:** a configuration that shows up repeatedly in the top group is more trustworthy than one that appears once. The logarithm keeps a high count from overwhelming the rank term.
+- **Max normalization:** each term answers "how close is this configuration to the best one?", so both terms lie in $[0, 1]$ and can be mixed with the weights above.
+
+---
+
+### Inference
+
+![Config Score](./png/config_score.png)
+
+The heat map shows `MC` vs `NC` for each `KC`. A higher score means the configuration lands among the fastest steady-state runs more consistently. The top configurations are:
+
+| Rank | (MC, NC, KC) | Score |
+|------|--------------|-------|
+| 1 | (16, 1024, 512) | 0.998 |
+| 2 | (16, 1024, 384) | 0.976 |
+| 3 | (32, 1024, 512) | 0.847 |
+| 4 | (32, 1024, 384) | 0.828 |
+| 5 | (32, 2048, 384) | 0.807 |
+
+#### Observations
+
+- **KC:** `KC = 384` and `KC = 512` dominate the top 10%. `KC = 256` reaches at most 0.786 (at MC = 16, NC = 2048), and `KC = 198` at most 0.471.
+- **MC:** smaller is better. At `NC = 1024` the score drops monotonically as MC grows: 0.998 → 0.847 → 0.304 for `KC = 512`, and 0.976 → 0.828 → 0.666 for `KC = 384`.
+- **NC:** `NC ≤ 256` almost never reaches the top group. For `KC ≥ 384` the peak sits at `NC = 1024`, and `NC = 2048` is competitive but lower (e.g. 0.767 vs 0.998 at MC = 16, KC = 512). For `KC ≤ 256`, `NC = 2048` is the better choice, which hints that the footprint of blockB (`KC x NC`) matters and not `NC` alone. It is not the whole story, though: (16, 2048, 256) and (16, 1024, 512) have the same `KC x NC` but score 0.786 vs 0.998.
+- **Difference from the single-thread version:** there, a larger `NC` is always better, probably because it reduces packing overhead and the number of loop iterations. With multiple threads the optimum settles at `NC = 1024` instead of growing further.
+
+#### Possible explanation
+
+The following are hypotheses, not measurements. With `float32` on Apple M1 (L1D: 128 KB per P-core, 64 KB per E-core; L2: 12 MB per P-cluster, 4 MB per E-cluster):
+
+- **blockA lives in L1, one copy per thread.** blockA is `MC x KC` floats: 24 KB at (16, 384) and 32 KB at (16, 512). If the 8 workers are spread over the 4 P-cores (128 KB L1D each) and the 4 E-cores (64 KB L1D each), a small-`MC` blockA fits comfortably in both and leaves room for the blockB micro-panels and the C tile that stream through. Larger `MC` strains the E-cores first (`MC = 32, KC = 512` and `MC = 64, KC ≥ 256` are already ≥ 64 KB, the whole E-core L1D) and then the P-cores (`MC = 64, KC = 512` is 128 KB). Because a parallel region only finishes when its slowest worker does, this is consistent with the monotonic `MC` trend, though not a clean cutoff: (64, 2048, 384) still scores 0.689.
+- **blockB lives in L2, but each cluster has its own L2.** The P-cluster has a 12 MB L2 and the E-cluster a 4 MB L2, so each cluster pulls its own copy of the in-use blockB into its L2. At `KC x NC = 512 x 1024` that is 2 MB, far larger than L1. At `KC x NC = 512 x 2048` it is 4 MB, the entire E-cluster L2 before counting blockA and C traffic, and the P-cluster also has to hold the next blockB half being packed (about 8 MB in total). This may explain the drop at `NC = 2048` for `KC = 512` (0.767 vs 0.998 at MC = 16).
+- **Small NC gives each parallel region little work.** With `NC ≤ 256`, synchronization and dispatch overhead take a larger share of the runtime, and blockB is repacked more often.
+
+---
+
+#### Further Study
+
+- The best configurations sit on the edge of the search grid (`MC = 16`, `KC = 512`), so the true optimum may lie outside it. Extending the sweep to smaller `MC` (subject to `MR`) and larger `KC` is worth trying.
