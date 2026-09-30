@@ -143,7 +143,8 @@ for round : repetitions
 
 ## Analysis
 
-Problem size: $M / N / K = 5347 / 4655 / 4201$
+- Problem size: $M / N / K = 5347 / 4655 / 4201$
+- Data type: `float32`
 
 ### Methodology
 
@@ -228,7 +229,7 @@ The heat map shows `MC` vs `NC` for each `KC`. A higher score means the configur
 
 #### Possible explanation
 
-The following are hypotheses, not measurements. With `float32` on Apple M1 (L1D: 128 KB per P-core, 64 KB per E-core; L2: 12 MB per P-cluster, 4 MB per E-cluster):
+The following are hypotheses, not measurements. On Apple M1 (L1D: 128 KB per P-core, 64 KB per E-core; L2: 12 MB per P-cluster, 4 MB per E-cluster):
 
 - **blockA lives in L1, one copy per thread.** blockA is `MC x KC` floats: 24 KB at (16, 384) and 32 KB at (16, 512). If the 8 workers are spread over the 4 P-cores (128 KB L1D each) and the 4 E-cores (64 KB L1D each), a small-`MC` blockA fits comfortably in both and leaves room for the blockB micro-panels and the C tile that stream through. Larger `MC` strains the E-cores first (`MC = 32, KC = 512` and `MC = 64, KC ≥ 256` are already ≥ 64 KB, the whole E-core L1D) and then the P-cores (`MC = 64, KC = 512` is 128 KB). Because a parallel region only finishes when its slowest worker does, this is consistent with the monotonic `MC` trend, though not a clean cutoff: (64, 2048, 384) still scores 0.689.
 - **blockB lives in L2, but each cluster has its own L2.** The P-cluster has a 12 MB L2 and the E-cluster a 4 MB L2, so each cluster pulls its own copy of the in-use blockB into its L2. At `KC x NC = 512 x 1024` that is 2 MB, far larger than L1. At `KC x NC = 512 x 2048` it is 4 MB, the entire E-cluster L2 before counting blockA and C traffic, and the P-cluster also has to hold the next blockB half being packed (about 8 MB in total). This may explain the drop at `NC = 2048` for `KC = 512` (0.767 vs 0.998 at MC = 16).
@@ -238,4 +239,9 @@ The following are hypotheses, not measurements. With `float32` on Apple M1 (L1D:
 
 #### Further Study
 
-- The best configurations sit on the edge of the search grid (`MC = 16`, `KC = 512`), so the true optimum may lie outside it. Extending the sweep to smaller `MC` (subject to `MR`) and larger `KC` is worth trying.
+The best configurations sit on the edge of the search grid (`MC = 16`, `KC = 512`), so the true optimum may lie outside it.
+
+Suggestion:
+- MC Exploration: Try MC $\in$ {8, 12, 16} (ensuring MC remains a multiple of your register tile size MR) to test if smaller L1 pressure yields further gains on E-cores.   
+- NC Resolution: Test intermediate values between 512, 1024, and 2048 (e.g., NC $\in$ {768, 1280, 1536}) to pinpoint the exact L2 thrashing threshold for multi-threaded B-block double buffering.   
+- KC Upper Bound: Extend KC $\in$ {640, 768, 1024} to see where A-block packing overhead outweighs the SIMD compute intensity.
