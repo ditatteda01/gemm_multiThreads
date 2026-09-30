@@ -217,7 +217,7 @@ int main() {
                         << perf.second.alg_ms << "ms\n";
         }
 
-        std::string logname{"gemm_multiThreads_" +std::to_string(rep_bench) + "rep_roundrobin.log"};
+        std::string logname{"gemm_mThds_" +std::to_string(rep_bench) + "rep.log"};
         std::ofstream ofile("log/" + logname);
         if (ofile.is_open()) {
             ofile << "C(" << M << ", " << N << ") = ";
